@@ -54,7 +54,6 @@ import org.apache.http.HttpRequestInterceptor;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.Credentials;
 import org.apache.http.client.HttpClient;
-import org.apache.http.client.params.CookiePolicy;
 import org.apache.http.entity.BufferedHttpEntity;
 import org.apache.http.impl.auth.KerberosScheme;
 import org.apache.http.protocol.HttpContext;
@@ -69,8 +68,8 @@ import org.apache.solr.client.solrj.impl.HttpClientUtil;
 import org.apache.solr.client.solrj.impl.HttpSolrClient;
 import org.apache.solr.client.solrj.impl.Krb5HttpClientBuilder;
 import org.apache.solr.client.solrj.impl.LBHttpSolrClient;
-import org.apache.solr.client.solrj.impl.SolrHttpClientBuilder;
 import org.apache.solr.client.solrj.impl.PreemptiveAuth;
+import org.apache.solr.client.solrj.impl.SolrHttpClientBuilder;
 import org.apache.solr.client.solrj.request.CollectionAdminRequest;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.client.solrj.response.CollectionAdminResponse;
@@ -220,7 +219,6 @@ public class SolrIndex implements IndexProvider {
             "When mutating - wait for the index to reflect new mutations before returning. This can have a negative impact on performance.",
             ConfigOption.Type.LOCAL, false);
 
-    
     /** Security Configuration */
     
     public static final ConfigOption<Boolean> KERBEROS_ENABLED = new ConfigOption<Boolean>(SOLR_NS,"kerberos-enabled",
@@ -269,34 +267,47 @@ public class SolrIndex implements IndexProvider {
         waitSearcher = config.get(WAIT_SEARCHER);
         
         if (kerberosEnabled) {
-	        	configureSolrClientsForKerberos();
+    		logger.debug("Kerberos is enabled. Configuring SOLR for Kerberos.");
+	        configureSolrClientsForKerberos();
+        } else {
+        	logger.debug("Kerberos is NOT enabled.");
+        	logger.debug("KERBEROS_ENABLED name is " + KERBEROS_ENABLED.getName() + " and it is" + (KERBEROS_ENABLED.isOption() ? " " : " not") + " an option.");
+        	logger.debug("KERBEROS_ENABLED type is " + KERBEROS_ENABLED.getType().name());
         }
         
-        final HttpClient cloudClientParams = HttpClientUtil.createClient(new ModifiableSolrParams() {{
-			add(HttpClientUtil.PROP_FOLLOW_REDIRECTS, "false"); // is this really necessary for kerberos?
-			add(HttpClientUtil.PROP_USE_RETRY, "true"); // is this really necessary for kerberos?
-        }});
-        
         if (mode==Mode.CLOUD) {
+        	final ModifiableSolrParams params = new ModifiableSolrParams() {{
+    			add(HttpClientUtil.PROP_FOLLOW_REDIRECTS, "false"); // is this really necessary for kerberos?
+    			add(HttpClientUtil.PROP_USE_RETRY, "true"); // is this really necessary for kerberos?
+            }};
+            
             final String zookeeperUrl = config.get(SolrIndex.ZOOKEEPER_URL);
             final CloudSolrClient cloudServer = new CloudSolrClient.Builder()
-            		.withHttpClient(cloudClientParams) // added by me; is this really necessary? It may not be a default http client will be created via the Builder.
+            	.withLBHttpSolrClientBuilder(
+            			new LBHttpSolrClient.Builder()
+                        .withHttpSolrClientBuilder(new HttpSolrClient.Builder().withInvariantParams(params))
+                        .withBaseSolrUrls(config.get(HTTP_URLS))
+            			)
                 .withZkHost(zookeeperUrl)
                 .sendUpdatesOnlyToShardLeaders()
                 .build();
             cloudServer.connect();
             solrClient = cloudServer;
         } else if (mode==Mode.HTTP) {
-        		//TODO: If the above client params are required then they will need to be set for this client too.
-            final HttpClient clientParams = HttpClientUtil.createClient(new ModifiableSolrParams() {{
+        	//TODO: If the above client params are required then they will need to be set for this client too.
+            final HttpClient clientWithParams = HttpClientUtil.createClient(new ModifiableSolrParams() {{
                 add(HttpClientUtil.PROP_ALLOW_COMPRESSION, config.get(HTTP_ALLOW_COMPRESSION).toString());
                 add(HttpClientUtil.PROP_CONNECTION_TIMEOUT, config.get(HTTP_CONNECTION_TIMEOUT).toString());
                 add(HttpClientUtil.PROP_MAX_CONNECTIONS_PER_HOST, config.get(HTTP_MAX_CONNECTIONS_PER_HOST).toString());
                 add(HttpClientUtil.PROP_MAX_CONNECTIONS, config.get(HTTP_GLOBAL_MAX_CONNECTIONS).toString());
+                if (kerberosEnabled) {
+                	add(HttpClientUtil.PROP_FOLLOW_REDIRECTS, "false"); // is this really necessary for kerberos?
+        			add(HttpClientUtil.PROP_USE_RETRY, "true"); // is this really necessary for kerberos?
+                }
             }});
-
+            
             solrClient = new LBHttpSolrClient.Builder()
-                .withHttpClient(clientParams)
+                .withHttpClient(clientWithParams)
                 .withBaseSolrUrls(config.get(HTTP_URLS))
                 .build();
 
@@ -307,26 +318,13 @@ public class SolrIndex implements IndexProvider {
     }
 
 	private void configureSolrClientsForKerberos() {
-		logger.debug("Kerberos is enabled. Configuring SOLR for Kerberos.");
 		System.setProperty("java.security.auth.login.config", kerberosConfig);
 		logger.debug("Using kerberos configuration file located at '{}'.", kerberosConfig);
 
 		try(Krb5HttpClientBuilder krbBuild = new Krb5HttpClientBuilder()) {
+			
 			SolrHttpClientBuilder kb = krbBuild.getBuilder();
-			
-			
-			Credentials useJaasCreds = new Credentials() {
-				public String getPassword() {
-					return null;
-				}
-				public Principal getUserPrincipal() {
-					return null;
-				}
-			};
-
-			kb.getCredentialsProviderProvider().getCredentialsProvider().setCredentials(AuthScope.ANY, useJaasCreds);
 			HttpClientUtil.setHttpClientBuilder(kb);
-			HttpClientUtil.setCookiePolicy(CookiePolicy.IGNORE_COOKIES);
 
 			HttpRequestInterceptor bufferedEntityInterceptor = new HttpRequestInterceptor() {
 				@Override
